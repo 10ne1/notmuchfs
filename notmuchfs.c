@@ -253,8 +253,7 @@ static bool in_maildir_subdir (const char *path, const char *base)
  */
 static void real_to_virtual (const char *real, char *virt, size_t length)
 {
- strncpy(virt, real, length - 1);
- virt[length - 1] = '\0';
+ snprintf(virt, length, "%s", real);
 
  char *base = strrchr(virt, '/');
  if (in_maildir_subdir(virt, base))
@@ -689,6 +688,53 @@ static int notmuchfs_releasedir (const char *path, struct fuse_file_info *fi)
 /*============================================================================*/
 
 /**
+ * Find the current name of a maildir file that was renamed after the
+ * database recorded it: a file in the same maildir's cur/ or new/ with the
+ * same unique name (the part before ':'). notmuch renames the file before it
+ * records the new name, so a listing in between would otherwise leave the
+ * message out, and an IMAP server would expunge it and give it a new UID.
+ *
+ * @param[in]  fname  The file name recorded in the database.
+ * @param[out] found  The current name, if any.
+ * @param[in]  length The length of 'found'.
+ * @return true if a file was found.
+ */
+static bool find_renamed (const char *fname, char *found, size_t length)
+{
+ const char *base = strrchr(fname, '/');
+ if (!in_maildir_subdir(fname, base))
+   return false;
+ /* The maildir, without the /cur or /new. */
+ int dir_length = base - fname - 4;
+ base++;
+ size_t unique_length = strcspn(base, ":");
+
+ const char *subdirs[] = { "cur", "new" };
+ for (size_t i = 0; i < sizeof(subdirs) / sizeof(subdirs[0]); i++) {
+   char dir_name[PATH_MAX];
+   snprintf(dir_name, sizeof(dir_name), "%.*s/%s", dir_length, fname,
+            subdirs[i]);
+   DIR *dir = opendir(dir_name);
+   if (dir == NULL)
+     continue;
+   struct dirent *de;
+   while ((de = readdir(dir)) != NULL) {
+     if (strncmp(de->d_name, base, unique_length) == 0 &&
+         (de->d_name[unique_length] == ':' ||
+          de->d_name[unique_length] == '\0')) {
+       int n = snprintf(found, length, "%s/%s", dir_name, de->d_name);
+       closedir(dir);
+       return n > 0 && (size_t)n < length;
+     }
+   }
+   closedir(dir);
+ }
+ return false;
+}
+
+/*============================================================================*/
+
+/**
  * Adds an entry to a readdir() buffer with a maildir file, representing the
  * given notmuch messages.
  *
@@ -711,9 +757,17 @@ static int fill_dir_with_message (opendir_t         *dir_fd,
  int res = 0;
 
  const char *fname = notmuch_message_get_filename(p_message);
+ char renamed[PATH_MAX];
  if (fname != NULL) {
    struct stat stbuf;
-   if (stat(fname, &stbuf) == 0) {
+   int st = stat(fname, &stbuf);
+   int err = errno;
+   if (st != 0 && err == ENOENT && find_renamed(fname, renamed, PATH_MAX)) {
+     fname = renamed;
+     st = stat(fname, &stbuf);
+     err = errno;
+   }
+   if (st == 0) {
      char trans_name[PATH_MAX];
      real_to_virtual(fname, trans_name, PATH_MAX);
 
@@ -727,14 +781,14 @@ static int fill_dir_with_message (opendir_t         *dir_fd,
        res = INT_MAX;
      }
    }
-   else if (errno == ENOENT) {
+   else if (err == ENOENT) {
      /* If a message is gone, don't stop the whole readdir(). */
      fprintf(stderr, "WARNING: Skipping missing file \"%s\".\n", fname);
    }
    else {
      fprintf(stderr, "ERROR: notmuch message stat error \"%s\" %s.\n", fname,
-             strerror(errno));
-     res = -errno;
+             strerror(err));
+     res = -err;
    }
  }
  else {
