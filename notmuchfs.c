@@ -27,8 +27,9 @@
  * @section message_names Message Names
  *
  * Messages in a notmuchfs virtual maildir are named by taking the full path
- * to the real message, and replacing all / with #. This whole string is now
- * the message name.
+ * to the real message, dropping its maildir's 'cur' or 'new' directory, and
+ * replacing all / with #. This whole string is now the message name, and it
+ * stays the same when the real file moves from new/ to cur/.
  *
  *
  * @section x_label X-Label Header
@@ -191,6 +192,92 @@ static void string_replace (char *str_in, char old, char new)
      *str = new;
    str++;
  }
+}
+
+/*============================================================================*/
+
+/**
+ * Whether the file at 'path' is in a maildir's cur/ or new/.
+ *
+ * @param[in] path The path.
+ * @param[in] base The last / in 'path'.
+ */
+static bool in_maildir_subdir (const char *path, const char *base)
+{
+ return base != NULL && base - path >= 4 &&
+        (memcmp(base - 4, "/cur", 4) == 0 || memcmp(base - 4, "/new", 4) == 0);
+}
+
+/*============================================================================*/
+
+/**
+ * Translate the path of a real message file into its name in a virtual
+ * maildir: drop the 'cur' or 'new' directory the file is in, then replace
+ * every / with #.
+ *
+ * Leaving that directory out keeps the name stable when the file moves from
+ * new/ to cur/, as it does when the message is first marked read. IMAP
+ * servers key message UIDs on the file name, so otherwise the message would
+ * look expunged and arrive again under a new UID.
+ *
+ * @param[in]  real   The real path.
+ * @param[out] virt   The virtual name.
+ * @param[in]  length The length of 'virt'.
+ */
+static void real_to_virtual (const char *real, char *virt, size_t length)
+{
+ strncpy(virt, real, length - 1);
+ virt[length - 1] = '\0';
+
+ char *base = strrchr(virt, '/');
+ if (in_maildir_subdir(virt, base))
+   memmove(base - 4, base, strlen(base) + 1);
+
+ string_replace(virt, '/', '#');
+}
+
+/*============================================================================*/
+
+/**
+ * Find the real file behind a virtual message name, the reverse of
+ * real_to_virtual(). The file is looked for in the maildir's cur/, then in
+ * its new/, then at the path itself, for a file that is not in a maildir.
+ *
+ * @param[in]  virt   The virtual name.
+ * @param[out] real   The real path. If no file is found, the cur/ candidate,
+ *                    which is where a renamed message belongs.
+ * @param[in]  length The length of 'real'.
+ * @return 0 if the file was found, -ENOENT if not, -ENAMETOOLONG if a
+ *         candidate does not fit in 'real'.
+ */
+static int virtual_to_real (const char *virt, char *real, size_t length)
+{
+ char path[PATH_MAX];
+ strncpy(path, virt, PATH_MAX - 1);
+ path[PATH_MAX - 1] = '\0';
+ string_replace(path, '#', '/');
+
+ const char *base = strrchr(path, '/');
+ if (base == NULL)
+   base = path;
+ int dir_length = base - path;
+
+ /* The last one, "", is the path itself. */
+ const char *subdirs[] = { "/cur", "/new", "" };
+ struct stat stbuf;
+ for (size_t i = 0; i < sizeof(subdirs) / sizeof(subdirs[0]); i++) {
+   int n = snprintf(real, length, "%.*s%s%s", dir_length, path, subdirs[i],
+                    base);
+   if (n < 0 || (size_t)n >= length)
+     return -ENAMETOOLONG;
+   if (stat(real, &stbuf) == 0)
+     return 0;
+ }
+
+ int n = snprintf(real, length, "%.*s/cur%s", dir_length, path, base);
+ if (n < 0 || (size_t)n >= length)
+   return -ENAMETOOLONG;
+ return -ENOENT;
 }
 
 /*============================================================================*/
@@ -369,12 +456,10 @@ static int notmuchfs_getattr (const char *path, struct stat *stbuf)
        (last_slash - first_slash > 3 &&
         strncmp(first_slash, "/cur/", 5) == 0)) {
      char trans_name[PATH_MAX];
-     strncpy(trans_name, last_slash + 1, PATH_MAX - 1);
-     trans_name[PATH_MAX - 1] = '\0';
-     string_replace(trans_name, '#', '/');
+     res = virtual_to_real(last_slash + 1, trans_name, PATH_MAX);
 
      LOG_TRACE("getattr stat3: %s\n", trans_name);
-     if (stat(trans_name, stbuf) != 0)
+     if (res == 0 && stat(trans_name, stbuf) != 0)
        res = -errno;
 
      /* Inflate the size of the file by the maximum length of a synthetic
@@ -603,9 +688,7 @@ static int fill_dir_with_message (opendir_t         *dir_fd,
    struct stat stbuf;
    if (stat(fname, &stbuf) == 0) {
      char trans_name[PATH_MAX];
-     strncpy(trans_name, fname, PATH_MAX - 1);
-     trans_name[PATH_MAX - 1] = '\0';
-     string_replace(trans_name, '/', '#');
+     real_to_virtual(fname, trans_name, PATH_MAX);
 
      /* Perpetuate the file size inflation lie told in getattr(). */
      stbuf.st_size += MAX_XLABEL_LENGTH;
@@ -819,7 +902,11 @@ static int notmuchfs_open (const char *path, struct fuse_file_info *fi)
 
    char *first_pslash = strchr(trans_name, '#');
    if (first_pslash != NULL) {
-     string_replace(trans_name, '#', '/');
+     int err = virtual_to_real(last_slash + 1, trans_name, PATH_MAX);
+     if (err != 0) {
+       free(p_open);
+       return err;
+     }
 
      struct fuse_context *p_fuse_ctx = fuse_get_context();
      notmuch_context_t   *p_ctx      =
@@ -1056,14 +1143,24 @@ static int notmuchfs_rename (const char* from, const char* to)
   * directory.
   */
  char trans_name_from[PATH_MAX];
- strncpy(trans_name_from, last_slash_from + 1, PATH_MAX - 1);
- trans_name_from[PATH_MAX - 1] = '\0';
- string_replace(trans_name_from, '#', '/');
+ int err = virtual_to_real(last_slash_from + 1, trans_name_from, PATH_MAX);
+ if (err != 0)
+   return err;
 
+ /* A message in a maildir is renamed into its cur/, even from new/: a file
+  * whose name carries flags belongs there.
+  */
  char trans_name_to[PATH_MAX];
- strncpy(trans_name_to, last_slash_to + 1, PATH_MAX - 1);
- trans_name_to[PATH_MAX - 1] = '\0';
- string_replace(trans_name_to, '#', '/');
+ if (in_maildir_subdir(trans_name_from, strrchr(trans_name_from, '/'))) {
+   err = virtual_to_real(last_slash_to + 1, trans_name_to, PATH_MAX);
+   if (err != 0 && err != -ENOENT)
+     return err;
+ }
+ else {
+   strncpy(trans_name_to, last_slash_to + 1, PATH_MAX - 1);
+   trans_name_to[PATH_MAX - 1] = '\0';
+   string_replace(trans_name_to, '#', '/');
+ }
 
  LOG_TRACE("rename(%s, %s)\n", trans_name_from, trans_name_to);
  if (rename(trans_name_from, trans_name_to) == -1)
@@ -1167,9 +1264,9 @@ static int notmuchfs_unlink (const char* path)
  if (last_pslash != NULL) {
    const char *last_slash = strrchr(path, '/');
 
-   strncpy(trans_name, last_slash + 1, PATH_MAX - 1);
-   trans_name[PATH_MAX - 1] = '\0';
-   string_replace(trans_name, '#', '/');
+   int err = virtual_to_real(last_slash + 1, trans_name, PATH_MAX);
+   if (err != 0)
+     return err;
 
    path = trans_name;
  }
