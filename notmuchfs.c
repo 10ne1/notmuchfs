@@ -734,6 +734,41 @@ static bool find_renamed (const char *fname, char *found, size_t length)
 
 /*============================================================================*/
 
+/** The maildir flags of a file name: what follows ":2,", or "". */
+static const char *maildir_flags (const char *name)
+{
+ const char *info = strstr(name, ":2,");
+ return info != NULL ? info + 3 : "";
+}
+
+/**
+ * Apply the flag change from 'from' to 'to' (two names of one message) to
+ * the flags 'current' the file has now, so that a client renaming from a
+ * name it read earlier changes only the flags it meant to change, and keeps
+ * the changes made in between by others.
+ *
+ * @param[out] out The merged flags, in ASCII order as maildir requires.
+ */
+static void merge_flags (const char *current, const char *from, const char *to,
+                         char *out, size_t length)
+{
+ size_t n = 0;
+ for (int c = 33; c < 127 && n + 1 < length; c++) {
+   bool now  = strchr(current, c) != NULL;
+   bool was  = strchr(from, c) != NULL;
+   bool want = strchr(to, c) != NULL;
+   if (want && !was)
+     now = true;
+   else if (was && !want)
+     now = false;
+   if (now)
+     out[n++] = c;
+ }
+ out[n] = '\0';
+}
+
+/*============================================================================*/
+
 /**
  * Adds an entry to a readdir() buffer with a maildir file, representing the
  * given notmuch messages.
@@ -1225,20 +1260,62 @@ static int notmuchfs_rename (const char* from, const char* to)
 
  /* Renaming from one file name to another, both in the same (maildir)
   * directory.
+  *
+  * Hold the database write lock from before the file is renamed until the
+  * database knows the new name: otherwise a `notmuch tag' in between works
+  * from the old name and tags, and the two undo each other's flags.
   */
+ struct fuse_context *p_fuse_ctx = fuse_get_context();
+ notmuch_context_t    *p_ctx     =
+   (notmuch_context_t *)p_fuse_ctx->private_data;
+
+ database_open(p_ctx, TRUE);
+
  char trans_name_from[PATH_MAX];
+ char merged_to[NAME_MAX + 1];
  int err = virtual_to_real(last_slash_from + 1, trans_name_from, PATH_MAX);
- if (err != 0)
+ if (err == -ENOENT) {
+   /* The client read the name before someone else renamed the file. Rename
+    * the file it has now, changing only the flags the client changed.
+    */
+   char current[PATH_MAX];
+   if (find_renamed(trans_name_from, current, PATH_MAX)) {
+     const char *base = strrchr(current, '/') + 1;
+     char flags[64];
+     merge_flags(maildir_flags(base), maildir_flags(last_slash_from + 1),
+                 maildir_flags(last_slash_to + 1), flags, sizeof(flags));
+     snprintf(merged_to, sizeof(merged_to), "%.*s:2,%s",
+              (int)strcspn(base, ":"), base, flags);
+     fprintf(stderr, "NOTE: rename of %s: the file is now %s, renaming it to"
+             " %s\n", trans_name_from, current, merged_to);
+     memcpy(trans_name_from, current, PATH_MAX);
+     err = 0;
+   }
+   else
+     merged_to[0] = '\0';
+ }
+ else
+   merged_to[0] = '\0';
+ if (err != 0) {
+   database_close(p_ctx);
    return err;
+ }
 
  /* A message in a maildir is renamed into its cur/, even from new/: a file
   * whose name carries flags belongs there.
   */
  char trans_name_to[PATH_MAX];
- if (in_maildir_subdir(trans_name_from, strrchr(trans_name_from, '/'))) {
+ if (merged_to[0] != '\0') {
+   const char *base = strrchr(trans_name_from, '/');
+   snprintf(trans_name_to, PATH_MAX, "%.*s/cur/%s",
+            (int)(base - trans_name_from - 4), trans_name_from, merged_to);
+ }
+ else if (in_maildir_subdir(trans_name_from, strrchr(trans_name_from, '/'))) {
    err = virtual_to_real(last_slash_to + 1, trans_name_to, PATH_MAX);
-   if (err != 0 && err != -ENOENT)
+   if (err != 0 && err != -ENOENT) {
+     database_close(p_ctx);
      return err;
+   }
  }
  else {
    strncpy(trans_name_to, last_slash_to + 1, PATH_MAX - 1);
@@ -1247,17 +1324,15 @@ static int notmuchfs_rename (const char* from, const char* to)
  }
 
  LOG_TRACE("rename(%s, %s)\n", trans_name_from, trans_name_to);
- if (rename(trans_name_from, trans_name_to) == -1)
-   return -errno;
+ if (rename(trans_name_from, trans_name_to) == -1) {
+   err = -errno;
+   database_close(p_ctx);
+   return err;
+ }
 
 
  /* Rename it in the notmuch database too. */
  int                  res        = 0;
- struct fuse_context *p_fuse_ctx = fuse_get_context();
- notmuch_context_t    *p_ctx     =
-   (notmuch_context_t *)p_fuse_ctx->private_data;
-
- database_open(p_ctx, TRUE);
 
  if (notmuch_database_begin_atomic(p_ctx->db) != NOTMUCH_STATUS_SUCCESS) {
    res = -EIO;
