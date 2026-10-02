@@ -103,6 +103,13 @@ struct notmuchfs_config {
   char *delete_tag;
 
   /**
+   * The name of the Trash folder in a Maildir++ account, e.g. ".Trash". When
+   * set (and delete_tag is not), deleting a message moves it there unless a
+   * copy is already there; see unlink_to_trash().
+   */
+  char *trash;
+
+  /**
    * Mutt is not compliant with the maildir spec, see:
    * - http://dev.mutt.org/trac/ticket/2476
    * - http://notmuchmail.org/pipermail/notmuch/2011/004833.html
@@ -1274,6 +1281,198 @@ static int notmuchfs_rename (const char* from, const char* to)
 
 /*============================================================================*/
 
+/**
+ * Whether two files have the same contents.
+ *
+ * @param[in] a    The path of one file.
+ * @param[in] b    The path of the other.
+ * @param[in] size The size of both, already known to be equal.
+ */
+static bool files_equal (const char *a, const char *b, off_t size)
+{
+ bool equal = FALSE;
+ int  fd_a  = open(a, O_RDONLY);
+ int  fd_b  = open(b, O_RDONLY);
+
+ if (fd_a != -1 && fd_b != -1) {
+   char    buf_a[65536];
+   char    buf_b[sizeof(buf_a)];
+   off_t   done = 0;
+   ssize_t n;
+
+   while ((n = read(fd_a, buf_a, sizeof(buf_a))) > 0 &&
+          read(fd_b, buf_b, n) == n &&
+          memcmp(buf_a, buf_b, n) == 0) {
+     done += n;
+   }
+   equal = (n == 0 && done == size);
+ }
+
+ if (fd_a != -1)
+   close(fd_a);
+ if (fd_b != -1)
+   close(fd_b);
+ return equal;
+}
+
+/*============================================================================*/
+
+/**
+ * Whether a maildir already holds a byte-for-byte copy of a message file.
+ *
+ * An IMAP client that deletes by COPY to Trash then EXPUNGE leaves exactly
+ * such a copy, since IMAP servers copy the message verbatim. It is too new
+ * to be in the notmuch database, so the folder itself is searched.
+ *
+ * @param[in] folder The maildir to search (its cur/ and new/).
+ * @param[in] real   The message file.
+ * @param[in] size   The size of 'real'.
+ */
+static bool folder_has_copy (const char *folder, const char *real, off_t size)
+{
+ const char *subdirs[] = { "cur", "new" };
+
+ for (size_t i = 0; i < sizeof(subdirs) / sizeof(subdirs[0]); i++) {
+   char dir_name[PATH_MAX];
+   int  n = snprintf(dir_name, PATH_MAX, "%s/%s", folder, subdirs[i]);
+   if (n < 0 || n >= PATH_MAX)
+     continue;
+
+   DIR *dir = opendir(dir_name);
+   if (dir == NULL)
+     continue;
+
+   bool           found = FALSE;
+   struct dirent *de;
+   while (!found && (de = readdir(dir)) != NULL) {
+     if (de->d_name[0] == '.')
+       continue;
+
+     char        name[PATH_MAX];
+     struct stat stbuf;
+     n = snprintf(name, PATH_MAX, "%s/%s", dir_name, de->d_name);
+     if (n > 0 && n < PATH_MAX && stat(name, &stbuf) == 0 &&
+         S_ISREG(stbuf.st_mode) && stbuf.st_size == size)
+       found = files_equal(name, real, size);
+   }
+   closedir(dir);
+
+   if (found)
+     return TRUE;
+ }
+ return FALSE;
+}
+
+/*============================================================================*/
+
+/**
+ * Delete a message file the way an IMAP server with a Trash folder does
+ * (courier's IMAP_MOVE_EXPUNGE_TO_TRASH): move it to its account's Trash,
+ * unless a copy is already there or it is in the Trash itself, in which
+ * cases it is removed. The notmuch database is updated to match.
+ *
+ * An IMAP server cannot do the move itself, since Trash is outside this
+ * file system: its rename() fails with EXDEV and it unlinks the message.
+ *
+ * @param[in] real The real path of the message file.
+ * @return 0 or a negative errno.
+ */
+static int unlink_to_trash (const char *real)
+{
+ /* The folder is the directory above cur/ or new/. In a Maildir++ layout,
+  * a subfolder's name starts with a dot and the account's Trash is its
+  * sibling, otherwise the Trash is inside the folder.
+  */
+ char        folder[PATH_MAX];
+ const char *base = strrchr(real, '/');
+ if (!in_maildir_subdir(real, base))
+   return unlink(real) == 0 ? 0 : -errno;
+ snprintf(folder, PATH_MAX, "%.*s", (int)(base - real - 4), real);
+
+ char  trash[PATH_MAX];
+ char *folder_base = strrchr(folder, '/');
+ int   n;
+ if (folder_base != NULL && folder_base[1] == '.')
+   n = snprintf(trash, PATH_MAX, "%.*s/%s", (int)(folder_base - folder),
+                folder, global_config.trash);
+ else
+   n = snprintf(trash, PATH_MAX, "%s/%s", folder, global_config.trash);
+ if (n < 0 || n >= PATH_MAX)
+   return -ENAMETOOLONG;
+
+ struct stat stbuf;
+ if (stat(real, &stbuf) != 0)
+   return -errno;
+
+ char target[PATH_MAX] = "";
+ if (strcmp(folder, trash) != 0 &&
+     !folder_has_copy(trash, real, stbuf.st_size)) {
+   n = snprintf(target, PATH_MAX, "%s/cur%s", trash, base);
+   if (n < 0 || n >= PATH_MAX)
+     return -ENAMETOOLONG;
+
+   /* As courier does, don't leave it marked deleted or draft in the Trash. */
+   char *info = strstr(strrchr(target, '/'), ":2,");
+   if (info != NULL) {
+     char *out = info + 3;
+     for (char *in = out; *in != '\0'; in++) {
+       if (*in != 'T' && *in != 'D')
+         *out++ = *in;
+     }
+     *out = '\0';
+   }
+ }
+
+ if (target[0] != '\0') {
+   LOG_TRACE("rename(%s, %s)\n", real, target);
+   if (rename(real, target) != 0)
+     return -errno;
+ }
+ else {
+   LOG_TRACE("unlink(%s)\n", real);
+   if (unlink(real) != 0)
+     return -errno;
+ }
+
+ /* Update the database now rather than at the next 'notmuch new', so that
+  * listings neither skip a missing file nor miss the moved one.
+  */
+ int                  res        = 0;
+ struct fuse_context *p_fuse_ctx = fuse_get_context();
+ notmuch_context_t   *p_ctx      =
+   (notmuch_context_t *)p_fuse_ctx->private_data;
+
+ database_open(p_ctx, TRUE);
+
+ if (notmuch_database_begin_atomic(p_ctx->db) != NOTMUCH_STATUS_SUCCESS) {
+   res = -EIO;
+ }
+ else {
+   if (target[0] != '\0') {
+     (void)notmuch_database_index_file(p_ctx->db, target, NULL, NULL);
+   }
+   (void)notmuch_database_remove_message(p_ctx->db, real);
+
+   if (target[0] != '\0') {
+     notmuch_message_t *p_message;
+     if (notmuch_database_find_message_by_filename(p_ctx->db, target,
+                                                   &p_message) ==
+         NOTMUCH_STATUS_SUCCESS && p_message != NULL) {
+       notmuch_message_maildir_flags_to_tags(p_message);
+       notmuch_message_destroy(p_message);
+     }
+   }
+   if (notmuch_database_end_atomic(p_ctx->db) != NOTMUCH_STATUS_SUCCESS)
+     res = -EIO;
+ }
+
+ database_close(p_ctx);
+
+ return res;
+}
+
+/*============================================================================*/
+
 static int notmuchfs_unlink (const char* path)
 {
  char trans_name[PATH_MAX];
@@ -1327,6 +1526,9 @@ static int notmuchfs_unlink (const char* path)
    }
 
    database_close(p_ctx);
+ }
+ else if (global_config.trash != NULL && last_pslash != NULL) {
+   return unlink_to_trash(path);
  }
  else {
    LOG_TRACE("unlink(%s)\n", path);
@@ -1401,6 +1603,7 @@ static struct fuse_opt notmuchfs_opts[] = {
   NOTMUCHFS_OPT("backing_dir=%s",               backing_dir, 0),
   NOTMUCHFS_OPT("mail_dir=%s",                  mail_dir, 0),
   NOTMUCHFS_OPT("delete_tag=%s",                delete_tag, 0),
+  NOTMUCHFS_OPT("trash=%s",                     trash, 0),
   NOTMUCHFS_OPT("mutt_2476_workaround",         mutt_2476_workaround_allowed, 1),
   NOTMUCHFS_OPT("nomutt_2476_workaround",       mutt_2476_workaround_allowed, 0),
   NOTMUCHFS_OPT("--mutt_2476_workaround=true",  mutt_2476_workaround_allowed, 1),
@@ -1427,6 +1630,8 @@ static void print_notmuchfs_usage (char *arg0) {
           "    -o backing_dir=PATH  Path to backing directory (required)\n"
           "    -o mail_dir=PATH     Path to parent directory of notmuch database (required)\n"
           "    -o delete_tag=TAG    Tag to apply when a mail is deleted\n"
+          "    -o trash=FOLDER      Move a deleted mail to this Maildir++ folder\n"
+          "                         (e.g. .Trash), unless a copy is already there\n"
           "    -o mutt_2476_workaround\n"
           "    -o nomutt_2476_workaround (default)\n"
           "    -o noxlabel          Serve messages without the X-Label header\n"
