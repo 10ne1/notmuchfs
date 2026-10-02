@@ -37,6 +37,11 @@
  * Each message read from a virtual maildir has an X-Label header inserted
  * on-the-fly, containing the concatenation of the notmuch tags of this
  * message (comma separated), up to #MAX_XLABEL_LENGTH characters long.
+ * The header is padded to that length, and every message is reported that
+ * much larger than its file.
+ *
+ * The noxlabel option turns this off: messages are then served exactly as
+ * they are on disk, and opening one does not touch the notmuch database.
  */
 
 /*============================================================================*/
@@ -104,6 +109,11 @@ struct notmuchfs_config {
    * Notmuchfs can workaround this issue if this field is set.
    */
   bool  mutt_2476_workaround_allowed;
+
+  /**
+   * Serve messages without the synthetic X-Label header.
+   */
+  bool  noxlabel;
 };
 
 static struct notmuchfs_config global_config;
@@ -128,6 +138,16 @@ static struct notmuchfs_config global_config;
  * The text of the X-Label header.
  */
 #define XLABEL "X-Label: "
+
+/*============================================================================*/
+
+/**
+ * The number of bytes the X-Label header adds in front of every message.
+ */
+static size_t xlabel_length (void)
+{
+ return global_config.noxlabel ? 0 : MAX_XLABEL_LENGTH;
+}
 
 /*============================================================================*/
 
@@ -465,7 +485,7 @@ static int notmuchfs_getattr (const char *path, struct stat *stbuf)
      /* Inflate the size of the file by the maximum length of a synthetic
       * X-Label header.
       */
-     stbuf->st_size += MAX_XLABEL_LENGTH;
+     stbuf->st_size += xlabel_length();
    }
    else {
      res = -ENOENT;
@@ -691,7 +711,7 @@ static int fill_dir_with_message (opendir_t         *dir_fd,
      real_to_virtual(fname, trans_name, PATH_MAX);
 
      /* Perpetuate the file size inflation lie told in getattr(). */
-     stbuf.st_size += MAX_XLABEL_LENGTH;
+     stbuf.st_size += xlabel_length();
      LOG_TRACE("readdir filling dir %s at %ld\n",
                trans_name, dir_fd->next_offset);
      if (filler(buf, trans_name, &stbuf, dir_fd->next_offset++) != 0) {
@@ -907,7 +927,9 @@ static int notmuchfs_open (const char *path, struct fuse_file_info *fi)
        free(p_open);
        return err;
      }
+   }
 
+   if (first_pslash != NULL && !global_config.noxlabel) {
      struct fuse_context *p_fuse_ctx = fuse_get_context();
      notmuch_context_t   *p_ctx      =
        (notmuch_context_t *)p_fuse_ctx->private_data;
@@ -1007,13 +1029,14 @@ static int notmuchfs_read (const char *path,
 {
  (void)path;
  char   *buf        = buf_in;
- size_t  offset_adj = MAX_XLABEL_LENGTH;
+ size_t  x_label    = xlabel_length();
+ size_t  offset_adj = x_label;
  open_t *p_open     = (open_t *)(uintptr_t)fi->fh;
 
  assert(p_open != NULL);
 
- if (offset < MAX_XLABEL_LENGTH) {
-   size_t bytes_to_copy = MIN((size_t)(MAX_XLABEL_LENGTH - offset), size);
+ if (offset < (off_t)x_label) {
+   size_t bytes_to_copy = MIN((size_t)(x_label - offset), size);
    memcpy(buf, p_open->x_label + offset, bytes_to_copy);
    buf += bytes_to_copy;
    offset_adj = offset + bytes_to_copy;
@@ -1382,6 +1405,7 @@ static struct fuse_opt notmuchfs_opts[] = {
   NOTMUCHFS_OPT("nomutt_2476_workaround",       mutt_2476_workaround_allowed, 0),
   NOTMUCHFS_OPT("--mutt_2476_workaround=true",  mutt_2476_workaround_allowed, 1),
   NOTMUCHFS_OPT("--mutt_2476_workaround=false", mutt_2476_workaround_allowed, 0),
+  NOTMUCHFS_OPT("noxlabel",                     noxlabel, 1),
 
   FUSE_OPT_KEY("-V",        KEY_VERSION),
   FUSE_OPT_KEY("--version", KEY_VERSION),
@@ -1405,6 +1429,7 @@ static void print_notmuchfs_usage (char *arg0) {
           "    -o delete_tag=TAG    Tag to apply when a mail is deleted\n"
           "    -o mutt_2476_workaround\n"
           "    -o nomutt_2476_workaround (default)\n"
+          "    -o noxlabel          Serve messages without the X-Label header\n"
           , arg0);
 }
 
