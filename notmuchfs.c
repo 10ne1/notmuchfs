@@ -64,6 +64,8 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/param.h>
+#include <sys/inotify.h>
+#include <poll.h>
 #include <string.h>
 
 #define FUSE_USE_VERSION 26
@@ -121,6 +123,17 @@ struct notmuchfs_config {
    * Serve messages without the synthetic X-Label header.
    */
   bool  noxlabel;
+
+  /**
+   * Wake inotify watchers of every query's cur/ when the database changes;
+   * see poke_thread().
+   */
+  bool  poke;
+
+  /**
+   * The absolute mount point, kept from the command line for poke_thread().
+   */
+  char *mount_point;
 };
 
 static struct notmuchfs_config global_config;
@@ -376,6 +389,107 @@ static void database_close (notmuch_context_t *p_ctx)
 /* FUSE operations. */
 
 /** The maximum length of the tag exclusion string. Arbitrarily chosen. */
+/**
+ * Name of the directory poke_thread() creates and removes in each query's
+ * cur/. It is never listed, and exists only between the two calls.
+ */
+#define POKE_NAME ".notmuchfs-poke"
+
+/** The poke directory that exists right now, as a FUSE path, or "". */
+static char            poke_path[PATH_MAX];
+static pthread_mutex_t poke_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/**
+ * Whether 'path' names a poke directory: '/<query>/cur/POKE_NAME'.
+ */
+static bool is_poke_path (const char *path)
+{
+ const char *last_slash = strrchr(path, '/');
+ return last_slash != NULL && last_slash - path >= 4 &&
+        strcmp(last_slash + 1, POKE_NAME) == 0 &&
+        memcmp(last_slash - 4, "/cur", 4) == 0;
+}
+
+/**
+ * Whether the poke directory 'path' exists right now.
+ */
+static bool poke_exists (const char *path)
+{
+ PTHREAD_LOCK(&poke_mutex);
+ bool exists = strcmp(poke_path, path) == 0;
+ PTHREAD_UNLOCK(&poke_mutex);
+ return exists;
+}
+
+/**
+ * Create and remove the poke directory in every query's cur/, through the
+ * mount, so the kernel sends IN_CREATE and IN_DELETE to inotify watchers of
+ * that cur/. A FUSE server has no other way to raise inotify events: the
+ * kernel's FUSE notifications only invalidate its caches.
+ */
+static void poke_all (void)
+{
+ DIR *dir = opendir(global_config.backing_dir);
+ if (dir == NULL)
+   return;
+
+ struct dirent *de;
+ while ((de = readdir(dir)) != NULL) {
+   if (de->d_name[0] == '.')
+     continue;
+   char path[PATH_MAX];
+   int n = snprintf(path, sizeof(path), "%s/%s/cur/" POKE_NAME,
+                    global_config.mount_point, de->d_name);
+   if (n < 0 || (size_t)n >= sizeof(path))
+     continue;
+   if (mkdir(path, 0700) == 0)
+     rmdir(path);
+   else
+     fprintf(stderr, "WARNING: poke %s: %s\n", path, strerror(errno));
+ }
+ closedir(dir);
+}
+
+/**
+ * Watch the Xapian directory of the notmuch database and poke every query
+ * after each change: a commit by notmuch new, a tag change from any client,
+ * or a rename through this mount. IMAP servers that wait on inotify (Courier
+ * in IDLE) then rescan the folder at once. Bursts of changes are merged: a
+ * poke follows 200 ms without further changes, or 1 s after the first one.
+ */
+static void *poke_thread (void *arg)
+{
+ (void)arg;
+
+ char xapian[PATH_MAX];
+ snprintf(xapian, sizeof(xapian), "%s/.notmuch/xapian", global_config.mail_dir);
+
+ int fd = inotify_init1(IN_CLOEXEC);
+ if (fd < 0 ||
+     inotify_add_watch(fd, xapian,
+                       IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE) < 0) {
+   fprintf(stderr, "ERROR: poke: cannot watch %s: %s\n", xapian,
+           strerror(errno));
+   return NULL;
+ }
+
+ char buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+ for (;;) {
+   if (read(fd, buf, sizeof(buf)) <= 0 && errno != EINTR)
+     break;
+
+   struct pollfd pfd = { .fd = fd, .events = POLLIN };
+   for (int waited = 0; waited < 1000 && poll(&pfd, 1, 200) > 0;
+        waited += 200) {
+     if (read(fd, buf, sizeof(buf)) <= 0)
+       break;
+   }
+   poke_all();
+ }
+ close(fd);
+ return NULL;
+}
+
 #define EXCLUDED_TAGS_MAX_LENGTH 128
 
 static void *notmuchfs_init (struct fuse_conn_info *conn)
@@ -407,6 +521,14 @@ static void *notmuchfs_init (struct fuse_conn_info *conn)
      p_ctx->excluded_tags[bytes_read - 1] = '\0';
    }
    (void)pclose(fp);
+ }
+
+ if (global_config.poke) {
+   pthread_t thread;
+   if (pthread_create(&thread, NULL, poke_thread, NULL) == 0)
+     pthread_detach(thread);
+   else
+     fprintf(stderr, "ERROR: cannot start the poke thread.\n");
  }
 
  return p_ctx;
@@ -460,6 +582,19 @@ static int notmuchfs_getattr (const char *path, struct stat *stbuf)
      res = -errno;
  }
  else {
+   if (is_poke_path(path)) {
+     /* The poke directory, while it exists: a copy of the query directory. */
+     if (!poke_exists(path))
+       return -ENOENT;
+     char trans_name[PATH_MAX];
+     const char *first_slash = strchr(path + 1, '/');
+     snprintf(trans_name, sizeof(trans_name), "%.*s",
+              (int)(first_slash - path - 1), path + 1);
+     if (stat(trans_name, stbuf) != 0)
+       res = -errno;
+     return res;
+   }
+
    /* '/<query>/cur/translated#msg#name' */
    const char *first_slash = strchr(path + 1, '/');
    bool  mutt_2476_workaround = FALSE;
@@ -1159,6 +1294,13 @@ static int notmuchfs_mkdir (const char* path, mode_t mode)
 {
  assert(path[0] == '/');
 
+ if (is_poke_path(path)) {
+   PTHREAD_LOCK(&poke_mutex);
+   strncpy(poke_path, path, PATH_MAX - 1);
+   PTHREAD_UNLOCK(&poke_mutex);
+   return 0;
+ }
+
  if (mkdir(path + 1, mode) == -1)
    return -errno;
  return 0;
@@ -1169,6 +1311,14 @@ static int notmuchfs_mkdir (const char* path, mode_t mode)
 static int notmuchfs_rmdir (const char* path)
 {
  assert(path[0] == '/');
+
+ if (is_poke_path(path)) {
+   PTHREAD_LOCK(&poke_mutex);
+   bool exists = strcmp(poke_path, path) == 0;
+   poke_path[0] = '\0';
+   PTHREAD_UNLOCK(&poke_mutex);
+   return exists ? 0 : -ENOENT;
+ }
 
  if (rmdir(path + 1) == -1)
    return -errno;
@@ -1738,6 +1888,7 @@ static struct fuse_opt notmuchfs_opts[] = {
   NOTMUCHFS_OPT("--mutt_2476_workaround=true",  mutt_2476_workaround_allowed, 1),
   NOTMUCHFS_OPT("--mutt_2476_workaround=false", mutt_2476_workaround_allowed, 0),
   NOTMUCHFS_OPT("noxlabel",                     noxlabel, 1),
+  NOTMUCHFS_OPT("poke",                         poke, 1),
 
   FUSE_OPT_KEY("-V",        KEY_VERSION),
   FUSE_OPT_KEY("--version", KEY_VERSION),
@@ -1764,6 +1915,8 @@ static void print_notmuchfs_usage (char *arg0) {
           "    -o mutt_2476_workaround\n"
           "    -o nomutt_2476_workaround (default)\n"
           "    -o noxlabel          Serve messages without the X-Label header\n"
+          "    -o poke              Raise inotify events in each query's cur/\n"
+          "                         when the database changes\n"
           , arg0);
 }
 
@@ -1787,6 +1940,12 @@ static int notmuchfs_opt_proc (void             *data,
      fuse_opt_add_arg(outargs, "--version");
      fuse_main(outargs->argc, outargs->argv, &notmuchfs_oper, NULL);
      exit(0);
+
+   case FUSE_OPT_KEY_NONOPT:
+     /* The first one is the mount point. */
+     if (global_config.mount_point == NULL)
+       global_config.mount_point = realpath(arg, NULL);
+     break;
  }
  return 1;
 }
@@ -1811,6 +1970,11 @@ int main(int argc, char *argv[])
      !S_ISDIR(stbuf.st_mode)) {
    fprintf(stderr, "Can't find backing dir \"%s\".\n",
            global_config.backing_dir);
+   exit(1);
+ }
+
+ if (global_config.poke && global_config.mount_point == NULL) {
+   fprintf(stderr, "Can't find the mount point, needed by -o poke.\n");
    exit(1);
  }
 
