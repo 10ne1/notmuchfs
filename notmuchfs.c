@@ -456,32 +456,62 @@ static void poke_all (void)
  * or a rename through this mount. IMAP servers that wait on inotify (Courier
  * in IDLE) then rescan the folder at once. Bursts of changes are merged: a
  * poke follows 200 ms without further changes, or 1 s after the first one.
+ *
+ * notmuch compact builds a new Xapian directory and renames it over the old
+ * one, which leaves a watch on the old directory with nothing to report. So
+ * the database directory is watched as well, and a new Xapian directory
+ * renamed or created there is watched in its turn.
  */
+#define POKE_XAPIAN_EVENTS (IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE)
+
+/**
+ * Read one batch of events from the poke thread's inotify 'fd', and watch
+ * 'xapian' again if a new directory of that name appeared in the database
+ * directory (watch descriptor 'db_wd').
+ *
+ * @return The read() result.
+ */
+static ssize_t poke_read (int fd, int db_wd, const char *xapian)
+{
+ char buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+ ssize_t len = read(fd, buf, sizeof(buf));
+
+ for (char *p = buf; len > 0 && p < buf + len; ) {
+   const struct inotify_event *ev = (const struct inotify_event *)p;
+   if (ev->wd == db_wd && ev->len > 0 && strcmp(ev->name, "xapian") == 0 &&
+       inotify_add_watch(fd, xapian, POKE_XAPIAN_EVENTS) < 0)
+     fprintf(stderr, "ERROR: poke: cannot watch %s: %s\n", xapian,
+             strerror(errno));
+   p += sizeof(struct inotify_event) + ev->len;
+ }
+ return len;
+}
+
 static void *poke_thread (void *arg)
 {
  (void)arg;
 
+ char db[PATH_MAX];
  char xapian[PATH_MAX];
+ snprintf(db, sizeof(db), "%s/.notmuch", global_config.mail_dir);
  snprintf(xapian, sizeof(xapian), "%s/.notmuch/xapian", global_config.mail_dir);
 
  int fd = inotify_init1(IN_CLOEXEC);
- if (fd < 0 ||
-     inotify_add_watch(fd, xapian,
-                       IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE) < 0) {
-   fprintf(stderr, "ERROR: poke: cannot watch %s: %s\n", xapian,
-           strerror(errno));
+ int db_wd = fd < 0 ? -1 : inotify_add_watch(fd, db, IN_MOVED_TO | IN_CREATE);
+ if (db_wd < 0 || inotify_add_watch(fd, xapian, POKE_XAPIAN_EVENTS) < 0) {
+   fprintf(stderr, "ERROR: poke: cannot watch %s: %s\n",
+           db_wd < 0 ? db : xapian, strerror(errno));
    return NULL;
  }
 
- char buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
  for (;;) {
-   if (read(fd, buf, sizeof(buf)) <= 0 && errno != EINTR)
+   if (poke_read(fd, db_wd, xapian) <= 0 && errno != EINTR)
      break;
 
    struct pollfd pfd = { .fd = fd, .events = POLLIN };
    for (int waited = 0; waited < 1000 && poll(&pfd, 1, 200) > 0;
         waited += 200) {
-     if (read(fd, buf, sizeof(buf)) <= 0)
+     if (poke_read(fd, db_wd, xapian) <= 0)
        break;
    }
    poke_all();
