@@ -56,6 +56,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <dirent.h>
@@ -1729,6 +1730,19 @@ static int unlink_to_trash (const char *real)
          *out++ = *in;
      }
      *out = '\0';
+   }
+
+   /* Drop an mbsync UID (",U=<digits>") from the name. It is a UID of the
+    * folder the file came from, which mbsync's state for the Trash folder
+    * never assigned: left in place, mbsync reports "UID beyond highest
+    * assigned" for the Trash channel instead of uploading the message.
+    */
+   char *uid = strstr(strrchr(target, '/'), ",U=");
+   if (uid != NULL && isdigit((unsigned char)uid[3])) {
+     char *end = uid + 3;
+     while (isdigit((unsigned char)*end))
+       end++;
+     memmove(uid, end, strlen(end) + 1);
    }
  }
 
