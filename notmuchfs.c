@@ -1369,7 +1369,12 @@ static int notmuchfs_rmdir (const char* path)
 
 static int notmuchfs_rename (const char* from, const char* to, unsigned int flags)
 {
- UNUSED(flags);
+ /* rename2() flags are not implemented: refuse them, as the kernel did for
+  * fuse2 file systems. Ignored, RENAME_EXCHANGE would become a plain rename
+  * that overwrites the target instead of swapping the two.
+  */
+ if (flags != 0)
+   return -EINVAL;
 
  assert(from[0] == '/');
  assert(to[0] == '/');
