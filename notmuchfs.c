@@ -955,10 +955,11 @@ static void merge_flags (const char *current, const char *from, const char *to,
  * @return A negative errno on error, 0 on success, #INT_MAX if the
  *         directory is too full to add this message.
  */
-static int fill_dir_with_message (opendir_t         *dir_fd,
-                                  notmuch_message_t *p_message,
-                                  void              *buf,
-                                  fuse_fill_dir_t    filler)
+static int fill_dir_with_message (opendir_t                 *dir_fd,
+                                  notmuch_message_t         *p_message,
+                                  void                      *buf,
+                                  fuse_fill_dir_t            filler,
+                                  enum fuse_fill_dir_flags   fill_flags)
 {
  assert(p_message != NULL);
 
@@ -983,7 +984,8 @@ static int fill_dir_with_message (opendir_t         *dir_fd,
      stbuf.st_size += xlabel_length();
      LOG_TRACE("readdir filling dir %s at %ld\n",
                trans_name, dir_fd->next_offset);
-     if (filler(buf, trans_name, &stbuf, dir_fd->next_offset++, 0) != 0) {
+     if (filler(buf, trans_name, &stbuf, dir_fd->next_offset++,
+                fill_flags) != 0) {
        LOG_TRACE("readdir filler full \"%s\".\n", trans_name);
        dir_fd->next_offset--;
        res = INT_MAX;
@@ -1018,10 +1020,16 @@ static int notmuchfs_readdir (const char            *path,
                               enum fuse_readdir_flags flags)
 {
  UNUSED(path);
- UNUSED(flags);
  int res = 0;
 
  opendir_t *dir_fd = (opendir_t *)(uintptr_t)fi->fh;
+
+ /* For readdirplus, hand each message's attributes over with its name: they
+  * are the ones getattr() would return, and the kernel then needs no lookup
+  * per message when the client goes on to open or stat it.
+  */
+ enum fuse_fill_dir_flags fill_flags =
+   (flags & FUSE_READDIR_PLUS) ? FUSE_FILL_DIR_PLUS : 0;
 
  switch (dir_fd->type) {
    case OPENDIR_TYPE_NOTMUCH_QUERY:
@@ -1041,7 +1049,8 @@ static int notmuchfs_readdir (const char            *path,
       while (res == 0 &&
              (p_message = notmuch_messages_get(dir_fd->p_messages)) != NULL) {
 
-        res = fill_dir_with_message(dir_fd, p_message, buf, filler);
+        res = fill_dir_with_message(dir_fd, p_message, buf, filler,
+                                    fill_flags);
 
         notmuch_message_destroy(p_message);
         if (res == INT_MAX) {
